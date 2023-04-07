@@ -9,6 +9,12 @@
 #include <linux/slab.h>
 #include <linux/delay.h>
 #include <linux/timer.h>
+#include <linux/device.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
+#include <linux/wait.h>
+#include <linux/poll.h>
 
 
 static unsigned int redLED = 26;
@@ -20,6 +26,63 @@ static unsigned int irqNumber;
 static unsigned int feedbackState = 0;
 static unsigned int buttonOnCooldown = 0;
 struct timer_list cooldown_timer;
+
+static char output_buf[64];
+static DEFINE_MUTEX(output_mutex);
+
+DECLARE_WAIT_QUEUE_HEAD(wait_queue_kiosk_data);
+
+static ssize_t kiosk_driver_read(struct file *file, char __user *buf, size_t count, loff_t *ppos)
+{
+    ssize_t ret;
+
+    mutex_lock(&output_mutex);
+    ret = simple_read_from_buffer(buf, count, ppos, output_buf, strlen(output_buf));
+    output_buf[0] = '\0';
+    mutex_unlock(&output_mutex);
+
+    return ret;
+}
+
+static ssize_t kiosk_driver_write(struct file *file, const char __user *buf, size_t count, loff_t *ppos)
+{
+    ssize_t ret;
+
+    mutex_lock(&output_mutex);
+    ret = simple_write_to_buffer(output_buf, sizeof(output_buf) - 1, ppos, buf, count);
+    output_buf[ret] = '\0';
+    mutex_unlock(&output_mutex);
+
+    return ret;
+}
+
+static unsigned int kiosk_driver_poll(struct file *file, struct poll_table_struct *wait)
+{
+    __poll_t mask = 0;
+  
+    poll_wait(file, &wait_queue_kiosk_data, wait);
+    pr_info("Poll function\n");
+  
+    if(strcmp(output_buf, "") == 0)
+    {
+        mask |= ( POLLOUT | POLLWRNORM );
+    }
+    return mask;
+}
+
+static const struct file_operations kiosk_fops = {
+    .owner = THIS_MODULE,
+    .read = kiosk_driver_read,
+    .write = kiosk_driver_write,
+    .poll = kiosk_driver_poll,
+};
+
+static struct miscdevice kiosk_device = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name = "kiosk",
+    .fops = &kiosk_fops,
+};
+
 
 //Quick and dirty way of checking all the pins
 static int check_pins_valid(void){
@@ -120,6 +183,8 @@ static void reset_state(void){
 void cooldown_timer_callback(struct timer_list *t)
 {
     printk("Sending to userspace the value : %d\n", feedbackState);
+    snprintf(output_buf, sizeof(output_buf), "%d\n", feedbackState);
+    //misc_device_notify(&kiosk_device);
     gpio_set_value(buzzer, 1);
     mdelay(50);
     gpio_set_value(buzzer, 0);
@@ -161,6 +226,7 @@ static irq_handler_t kioskbtn_irq_handler(unsigned int irq, void *dev_id, struct
 static int __init kiosk_driver_init(void)
 {
     int result = 0;
+    int ret = 0;
     printk("Kiosk Driver init begin\n");
     if (check_pins_valid())
     {
@@ -186,7 +252,15 @@ static int __init kiosk_driver_init(void)
         printk(KERN_ERR "Failed to request IRQ for GPIO button\n");
         return result;
     }
+    // Register the misc device
+    ret = misc_register(&kiosk_device);
+    if (ret < 0) {
+        printk(KERN_ERR "Failed to register misc device\n");
+        free_pins();
+        return ret;
+    }
     timer_setup(&cooldown_timer, cooldown_timer_callback, 0);
+    printk(KERN_INFO "kiosk-driver initialized\n");
 
     return 0;
 }
@@ -196,7 +270,8 @@ static void __exit kiosk_driver_exit(void)
     free_pins();
     free_irq(irqNumber, NULL);
     del_timer(&cooldown_timer);
-	printk("Leaving my driver!\n");
+    misc_deregister(&kiosk_device);
+    printk(KERN_INFO "kiosk-driver deregistered\n");
 	return;
 }
 
